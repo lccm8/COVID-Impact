@@ -1,0 +1,491 @@
+---
+title: "COVID-19 Impacts and factor analysis"
+author: "Leonardo Colosimo"
+date: "April 19 2021"
+output: 
+   html_document:
+         toc: true
+         theme: united
+---
+
+```{r, message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Initialize environment and load packages
+knitr::opts_knit$set(root.dir = getwd())
+Sys.setlocale(category = "LC_ALL", locale = "english")
+options(java.parameters = "-Xmx2048m")
+options(stringsAsFactors = FALSE)
+Sys.setlocale("LC_TIME","English_United States.1252")
+options(scipen = 999)
+rm(list=ls())    
+set.seed(123)
+library(plyr)    
+library(dplyr)   
+library(tidyr)   
+library(purrr)  
+library(magrittr)  
+library(lubridate)   
+library(readtext)
+library(xlsx)      
+library(openxlsx)
+library(missForest)
+library(xgboost)
+library(plotly)
+library(reshape2)
+library(Hmisc)
+library(vars)
+library(urca)
+library(xts)
+require(TTR)
+library(plotly)
+library(rjson)
+library(htmltools)
+```
+
+\tableofcontents
+
+
+# INTRODUCTION
+The COVID-19 pandemic has reached almost every country during 2020. As an effect of extreme social-distancing measures adopted by governments to fight an increasing sanitary crisis, an unprecedent shutdown of demand and supply chains drove world economies to recession.
+
+In order to quantify impact COVID-19, this study will use [IMF estimated figures for GDP real growth](https://www.imf.org/external/datamapper/NGDP_RPCH@WEO/OEMDC/ADVEC/WEOWORLD) for over 180 countries in 2020. It is known that this indicator is normally affected by a multitude of national and international factors, but the magnitude of the recession caused by the pandemic, as well as its global reach, makes it an adequate response variable to represent impact.
+
+<BR>
+```{r,message=FALSE,echo=FALSE,warning=FALSE}
+y <- openxlsx::readWorkbook("GDP growth.xlsx",sheet = 1)
+colnames(y) <- c("location","y")
+df <- read.csv("world_gdp_with_codes.csv")
+colnames(df) <- c("location","GDP","code")
+df <- merge(df,y,by="location")
+df <- df[!is.na(df$y),]
+plot_ly(df, type='choropleth', locations=df$code, z=df$y, text=df$location, colorscale="Purples",
+        zmin = min(df$y),zmax = max(df$y)) %>% layout(title = "GDP real growth (% change from 2019)")
+```
+
+The data to be explored includes 20 factors extracted from [ourworldindata.com](https://covid.ourworldindata.org/data/owid-covid-data.csv), varying from general demographic figures to more COVID-related statistics. A database with 8 additional features from an [IMF research](https://www.imf.org/en/Topics/imf-and-covid19/Fiscal-Policies-Database-in-Response-to-COVID-19) is also used to include information on fiscal and monetary stimulus announced by several countries in response to COVID.
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Load and filter data
+Data <- read.csv("owid-covid-data.csv")
+StringencyData <- Data[!is.na(Data$stringency_index),]
+Data <- Data[,-which(names(Data) == "stringency_index")]
+StringencyData <- aggregate(StringencyData$stringency_index, by=list(StringencyData$location), FUN=mean)
+colnames(StringencyData) <- c("location","stringency_index")
+Data <- Data[which(Data$date == "2020-12-31"),]
+Data <- Data[-which(Data$continent == ""),]
+Data %<>% merge(StringencyData,by="location")
+
+# Add IMF data
+
+IMF <- openxlsx::readWorkbook("IMF.xlsx",sheet = 1)
+Data <- merge(Data, IMF, by="location")
+Data %>% names()
+
+Features <- c("iso_code","location","total_cases_per_million","total_deaths_per_million","icu_patients_per_million",
+              "hosp_patients_per_million","total_tests_per_thousand","positive_rate","total_vaccinations_per_hundred",
+              "people_fully_vaccinated_per_hundred","stringency_index","population_density","median_age","gdp_per_capita",
+              "extreme_poverty","cardiovasc_death_rate","diabetes_prevalence","female_smokers","male_smokers",
+              "hospital_beds_per_thousand","life_expectancy","human_development_index","Fiscal.additional.subtotal",
+              "Fiscal.health","Fiscal.non.health","Fiscal.accelerated.or.deferredrev","Liquidity.subtotal",
+              "Liquidity.below.the.line","Liquidity.guarantees","Liquidity.quasi.fiscal")
+
+```
+
+```{r,warning=FALSE}
+# Check all features to be used as predictors
+Features[-c(1,2)]
+```
+
+After proper cleaning and structuring, different statistical methods are applied to data and results are analyzed. For practical purposes, this paper presents results of each step as it describes methodology and justifies the use of a particular approach.
+
+Immunization programs, despite crucial for understanding the most recent scenario, only started in the second half of December and thus its data cannot be used to model GDP real growth in 2020. For this reason, vaccination figures are explored separately and modelled with the use of a different statistical method.
+
+
+# DATA CLEANING AND STRUCTURING
+The major challenge of dealing with the available data is the large number of missing data, for both country figures (rows) and features (columns). Although some advanced machine learning algorithms can fit a regression model with missing data, linear correlations cannot be analyzed when that is the case.
+
+For this reason, the database is modified through the following steps:
+
+* Countries with less than 50% of data and features with less than 60% of data are excluded. These parameters were chosen based on different trials that aimed at keeping a reasonable number sample size while reducing rows and columns with excessive number of missing records.
+* Applying an imputation technique to the database, that is, replacing missing data with substituted values. The [random forest algorithm](https://rpubs.com/lmorgan95/MissForest) is used for this task.
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+
+# Countries with less than 50% data
+NoData <- apply(Data[,Features],1,function(x) sum(is.na(x))/length(Features))
+Delete <- which(NoData > 0.5)
+Data <- Data[-Delete,]
+
+# Missing data (40% NA)
+Missing <- apply(Data[,Features],2,function(x) sum(is.na(x))/nrow(Data))  
+Delete <- which(Missing >= 0.4) # Delete those with more than 40% missing
+Features <- Features[-Delete]
+Data <- Data[,Features]
+
+# Merge to response variable
+Data <- merge(Data,y, by="location")
+Data <- Data[!is.na(Data$y),]
+
+# Partition data
+set.seed(123)
+index <- sample(seq(nrow(Data)), round(nrow(Data)*0.8))
+Train <- Data[index,-c(1,2)]
+Test <- Data[-index,-c(1,2)]
+
+# Imputation to check for correlation
+impTrain <- missForest(as.matrix(Train))$ximp %>% as.data.frame()
+FeatureComplete <- rbind(Test, impTrain)
+impTest <- missForest(FeatureComplete)$ximp[1:nrow(Test), ]
+```
+
+Notes:
+
+* Imputed database will be used for correlation analysis and linear model fitting only. Modelling with other techniques will keep original table with missing data (see next).
+
+* Data is partitioned into train and test (validation) datasets.
+
+```{r,warning=FALSE}
+# Check number of countries left in data
+nrow(impTrain)
+```
+
+```{r,warning=FALSE}
+# Check number of features left in data
+ncol(impTrain)
+```
+
+```{r,warning=FALSE}
+# Overview of train data after cleaning and imputation
+Data[index,1] %>% cbind(impTrain) %>% head(5)
+```
+
+
+# FEATURE ANALYSIS AND MODELLING
+Feature anaysis and modelling will filter out predictors with weak impact on response variable (GDP real growth).
+
+## Correlation
+A table is created with Pearson correlation values between features and response variable, along with p-values of a correlation test. It is important to mention that these results do not imply causation, but simply a relationship or pattern between the values.
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Correlation to y
+cormat <- rcorr(as.matrix(impTrain))
+Correlation <- melt(cormat$r)
+Correlation <- Correlation[which(Correlation$Var1 == "y"),]
+cor.pv <- melt(cormat$P)
+Correlation <- merge(Correlation,cor.pv[which(cor.pv$Var1 == "y"),],by="Var2")
+Correlation <- Correlation[,c(1,3,5)]
+colnames(Correlation) <- c("Feature","Correlation","Pvalue")
+Correlation <- Correlation[order(Correlation$Pvalue),]
+```
+
+Results:
+
+```{r,warning=FALSE}
+# Check correlation to response variable
+Correlation
+```
+Note that 11 out of 19 predictors have a p-value lower than 0.05 in a [correlation test](https://courses.lumenlearning.com/introstats1/chapter/testing-the-significance-of-the-correlation-coefficient/), thus presenting sufficient evidence to conclude that there is a significant linear relationship (with alpha = 0.05).
+
+Keep in mind these correlation coefficients are calculated with imputed data, which can affect results. Another limitation of this analysis is that it does not account for non-linear relationships.
+
+
+## Xgboost
+The [Xgboost](https://towardsdatascience.com/be-careful-when-interpreting-your-features-importance-in-xgboost-6e16132588e7) is a gradient-boosting algorithm often used in machine learning solutions. The advantages of applying this method in variable selection include the flexibility of modelling with missing data, as well as the fact that it is able to handle co-dependence between predictors - while linear models are not.
+
+A xgboost model is fitted on train data, and parameters are adjusted in order to minimize error observed after prediction in test data. The error metric used in this analysis is the [root mean squared error (RMSE)](https://www.statisticshowto.com/probability-and-statistics/regression-analysis/rmse-root-mean-square-error/).
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Xgboost feature selection
+GbModel <- xgboost(data = as.matrix(Train[,-c(ncol(Train))]), label = as.matrix(Train$y), nrounds = 5,
+                   eta = 0.5, max_depth = 5)
+Pred <- predict(GbModel,as.matrix(Test[-c(ncol(Test))]))
+VarImp <- xgb.importance(feature_names = colnames(Train[,-ncol(Train)]), model = GbModel)
+```
+
+```{r,warning=FALSE}
+# Check RMSE of test data
+sqrt(mean((Test$y-Pred)^2))
+```
+
+## Compare predictor importance
+
+Correlation results (_Correlation_ and _Pvalue_) are complemented with xgboost outputs for variable importance in a single table. The column _NAs_ indicates the percentage of missing records in training data, while _VarImp_ and _ImpAboveMean_ are related to the improvement in accuracy brought by each feature in the xboost model.
+
+Results:
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Build importance table
+FeaturesImp <- Correlation[-which(Correlation$Feature == "y"),]
+FeaturesImp$NAs <- NA
+FeaturesImp$VarImp <- NA
+FeaturesImp$ImpAboveMean <- NA
+
+for(i in seq(nrow(FeaturesImp))) {
+  FeaturesImp$NAs[i] <- Missing[which(names(Missing) == FeaturesImp$Feature[i])] %>% round(2)
+  FeaturesImp$VarImp[i] <- VarImp$Gain[which(VarImp$Feature == FeaturesImp$Feature[i])] %>% round(2)
+  FeaturesImp$ImpAboveMean[i] <- FeaturesImp$VarImp[i] >= mean(VarImp$Gain)
+}
+
+FeaturesImp$Correlation %<>% round(2)
+FeaturesImp$Pvalue %<>% round(2)
+```
+
+```{r,warning=FALSE}
+# Compare variable importance
+FeaturesImp
+```
+
+Among all 11 predicts with a p-value lower than 0.05 in the correlation test, only 4 are above average in variable importance to the xgboost model. Note that [stringency index](https://ourworldindata.org/grapher/covid-stringency-index), which is a metric directly related to pandemic response by governments, has no missing values and a p-value of 0.03. Its _VarImp_, however, is one of the lowest in record.
+
+The next step is to eliminate features with weak results. Only variables with a p-value lower than alpha (0.05) or with above-average _VarImp_ are selected:
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Clean those below average in xgboost or pval < 0.1 in cor.test
+FeaturesImp <- FeaturesImp[which(FeaturesImp$Pvalue <= 0.05 | FeaturesImp$ImpAboveMean),]
+newTrain <- impTrain[,which(names(impTrain) %in% c(as.character(FeaturesImp$Feature),"y"))]
+newTest <- impTest[,which(names(impTest) %in% c(as.character(FeaturesImp$Feature),"y"))]
+```
+
+```{r,warning=FALSE}
+# Check features left in data after selection
+newTrain %>% names()
+```
+
+## Correlation among features and data transformations
+
+If a linear model is to be considered, the issue of collinearity among predictors must be addressed. A correlation table summarizes these relationships found in data, indicating correlation coefficient and the p-value status for each case (p < .0001 ' * * * * '; p < .001 ' * * * ', p < .01 ' * * ', p < .05 ' * ').
+
+Results:
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Feature correlation
+source("corstars.R")
+FeatCorrelation <- corstars(newTrain[,-ncol(newTrain)])
+```
+
+```{r,warning=FALSE}
+# Show feature correlation table
+FeatCorrelation
+```
+
+[Principal component analysis](https://builtin.com/data-science/step-step-explanation-principal-component-analysis) is one of the appropriate methods of solving the collinearity among variables. It is applied to 4 groups of predictors and only the first component (PC1) of each group will be used in final database:
+
+* General demographics: _median_age_,_extreme_poverty_, _life_expectancy_, _human_development_index_ and _gdp_per_capita_
+* COVID cases and deaths: _total_cases_per_million_ and _total_deaths_per_million_
+* Stimulus: _Liquidity.subtotal_, _Fiscal.additional.subtotal_, _Fiscal.non.health_ and _Fiscal.health_
+* Smokers: _female_smokers_ and _male_smokers_
+
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# PCA
+PCA_feat <- c("median_age","extreme_poverty","life_expectancy","human_development_index",
+              "gdp_per_capita")
+PCA <- prcomp(newTrain[,which(names(newTrain) %in% PCA_feat)])
+summary(PCA)
+Demographics <- PCA$x[,1]
+newTrain <- cbind(newTrain[,-which(names(newTrain) %in% PCA_feat)],Demographics) 
+PCA_test <- predict(PCA, newdata = newTest[,which(names(newTest) %in% PCA_feat)])
+Demographics <- PCA_test[,1]
+newTest <- cbind(newTest[,-which(names(newTest) %in% PCA_feat)],Demographics) 
+# COVID cases and deaths
+PCA_feat <- c("total_cases_per_million","total_deaths_per_million")
+PCA <- prcomp(newTrain[,which(names(newTrain) %in% PCA_feat)])
+summary(PCA)
+Cases_and_deaths <- PCA$x[,1]
+newTrain <- cbind(newTrain[,-which(names(newTrain) %in% PCA_feat)],Cases_and_deaths)
+PCA_test <- predict(PCA, newdata = newTest[,which(names(newTest) %in% PCA_feat)])
+Cases_and_deaths <- PCA_test[,1]
+newTest <- cbind(newTest[,-which(names(newTest) %in% PCA_feat)],Cases_and_deaths) 
+# Stimulus
+PCA_feat <- c("Liquidity.subtotal","Fiscal.additional.subtotal","Fiscal.non.health","Fiscal.health")
+PCA <- prcomp(newTrain[,which(names(newTrain) %in% PCA_feat)])
+summary(PCA)
+Stimulus <- PCA$x[,1]
+newTrain <- cbind(newTrain[,-which(names(newTrain) %in% PCA_feat)],Stimulus)
+PCA_test <- predict(PCA, newdata = newTest[,which(names(newTest) %in% PCA_feat)])
+Stimulus <- PCA_test[,1]
+newTest <- cbind(newTest[,-which(names(newTest) %in% PCA_feat)],Stimulus)
+# Smokers
+PCA_feat <- c("female_smokers","male_smokers")
+PCA <- prcomp(newTrain[,which(names(newTrain) %in% PCA_feat)])
+summary(PCA)
+Smokers <- PCA$x[,1]
+newTrain <- cbind(newTrain[,-which(names(newTrain) %in% PCA_feat)],Smokers)
+PCA_test <- predict(PCA, newdata = newTest[,which(names(newTest) %in% PCA_feat)])
+Smokers <- PCA_test[,1]
+newTest <- cbind(newTest[,-which(names(newTest) %in% PCA_feat)],Smokers)
+```
+
+At this point data had a decrease in features from 28 to 6:
+
+```{r,warning=FALSE}
+# Check features in final data
+newTrain %>% names()
+```
+
+## Linear model
+
+The main goal of fitting a linear model is not to generate predictions, but to [analyze its outputs](https://dss.princeton.edu/online_help/analysis/interpreting_regression.htm):
+
+* R-squared, representing the proportion of variance accounted for the model
+* Beta coefficients, representing the size and direction of the variable effect on GDP real growth 
+* Coefficient p-values, testing the null hypothesis that the coefficient is equal to zero (no effect on GDP real growth)
+
+Results:
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Fit linear model
+LinearModel <- lm(y ~ ., data = newTrain)
+```
+
+```{r,warning=FALSE}
+# Show linear model output
+summary(LinearModel)
+```
+
+As indicated by the (adjusted) R-squared metric, this model is only able to explain 24.6% of the variance of GDP real growth of 2020. Despite the low value, fitting a linear model had the main goal of understanding the relationships between factors and response variable.
+
+_Smokers_ is the only variable for which its beta is not significant at an alpha of 0.1. It is eliminated from the database and another model is fitted:
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Fit linear model
+newTrain <- newTrain[,-which(names(newTrain) == "Smokers")]
+LinearModel <- lm(y ~ ., data = newTrain)
+```
+
+```{r,warning=FALSE}
+# Show second linear model output
+summary(LinearModel)
+Pred <- predict(LinearModel, newTest)
+sqrt(mean((newTest$y-Pred)^2))
+```
+
+The second model has all coefficients with p-value lower than 0.1 and also shows minor improvement on adjusted R-squared.
+
+As noticed in the coefficient table, all but 2 variables (_Demographics_ and _Stimulus_) have opposite impact on GDP real growth, that is, response variable tend to increase if they decrease.
+
+Note: RMSE for test data is slightly better than that of the Xgboost model (5.932597).
+
+
+# THE VACCINATION CASE
+
+Vaccination could not be used in modelling since it has only started in the second half of December 2020. Despite of that, data of countries already advanced in the process of immunization is available and can be used to further analyze how it can impact other factors.
+
+Stringency index, a statistically significant coefficient in our linear model (alpha = 0.1), is expected to drop as more people become immune to the virus. It is possible to validate this hypothesis by using [VAR/VECM time series modelling](https://www.reed.edu/economics/parker/s14/312/tschapters/S13_Ch_5.pdf), as a cointegration between stringency and vaccination figures could provide favorable evidence.
+
+Israel, a country where oved 60% of its population is already vaccinated, will be our case for this analysis. From its data, 2 time-series are selected: total vaccination and stringency index, starting from December 19th 2020.
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Load Israeli data
+Data <- read.csv("owid-covid-data.csv")
+Data <- Data[which(Data$location == "Israel"),]
+names(Data)
+Keep <- c("date","total_vaccinations","people_vaccinated","people_fully_vaccinated","new_vaccinations",
+          "new_vaccinations_smoothed","total_vaccinations_per_hundred","people_vaccinated_per_hundred",
+          "people_fully_vaccinated_per_hundred","stringency_index")
+for(i in 2:nrow(Data)) {
+  if(is.na(Data$stringency_index[i])) Data$stringency_index[i] <- Data$stringency_index[i-1]
+}
+stringency_index_smoothed <- TTR::SMA(Data$stringency_index,n=7)
+Data$stringency_index <- stringency_index_smoothed
+Data <- Data[!is.na(Data$total_vaccinations),Keep]
+Date <- Data$date %>% as.Date() %>% as.POSIXct()
+Data <- Data[,-1] %<>% as.xts(order.by = Date)
+
+a2 <- 1/Data$stringency_index
+
+t = 1
+names(Data[,t])
+set.seed(123)
+
+a1 <- Data[,t]
+# Treat NA
+if(is.na(a1[1])) a1[1] <- 0
+for(i in 2:nrow(Data)) {
+ if(is.na(a1[i])) a1[i] <- a1[i-1]
+}
+
+TotalVaccination <- as.ts(a1)
+InverseStringencyIndex <- as.ts(a2)
+CompareTimeSeries <- ts.intersect(TotalVaccination,InverseStringencyIndex)
+```
+
+```{r,warning=FALSE}
+# Overview of time series
+Data[,c(1,9)] %>% head(5)
+```
+
+Stringency index is modified to better show an eventual relationship to total vaccinations: data is smoothed with a one week simple moving average and inverted.
+
+```{r,warning=FALSE}
+# Compare time series
+plot.ts(CompareTimeSeries)
+```
+
+Inverted stringency index apparently follows total vaccination as it increases.
+
+## Lag order selection
+
+This relationship between vaccination and stringency index is time-lagged, as one time series must be shifted in time to present correlation to another.
+
+The selection of an optimal lag length to be used in a VAR model estimation can be done in different ways. Plotting a cross correlation function (CCF) chart of the log-transformed time series is useful for a visual approach in determining best lag order:
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+VaccinationTransformed <- diff(as.numeric(log(a1)))
+StringencyTransformed <- diff(as.numeric(log(a2)))
+```
+
+```{r,warning=FALSE}
+# Select best lag
+ccf(VaccinationTransformed,StringencyTransformed,lag.max = 10)
+```
+
+The blue dotted lines represent limits for a statistically significant correlation. In this case, lags from -7 to -10 periods in total vaccination show relationship to inverted stringency index.
+
+Another method of selecting optimal lag is to calculate different metrics used as criteria. [Final Prediction Error (FPE) Akaike (AIC), Hannah-Quinn (HQ) and Schwarz information criteria (SC)](https://www.rdocumentation.org/packages/vars/versions/1.5-3/topics/VARselect#References) are commonly used methodologies for this procedure.
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+idx <- ts.intersect(diff(as.ts(a1)),diff(as.ts(a2)))
+vModel <- VARselect(idx, lag.max=10, type="const")
+```
+
+```{r,warning=FALSE}
+# Check best lag order
+vModel
+```
+
+The lag order that minimises each of the criteria indicates the optimal value for estimating a VAR model. Note that all of the 4 methods indicates 8 as optimal, which is used for fitting.
+
+## Johansen procedure
+
+A cointegration test is used to establish if there is a correlation between vaccination and stringency index in the long term. The [Johansen test (or procedure)](https://www.quantstart.com/articles/Johansen-Test-for-Cointegrating-Time-Series-Analysis-in-R/) is used to analyze cointegration relationship among these variables:
+
+```{r,message=FALSE,echo=FALSE,results = "hide",warning=FALSE}
+# Test for cointegration
+JTest <- try(ca.jo(log(CompareTimeSeries),type="trace", K=8, ecdet="none", spec="longrun"),silent = TRUE)
+```
+
+```{r,warning=FALSE}
+# Test for cointegration
+summary(JTest)
+```
+
+For r = 0, test statistic (19.49) is higher than the 5% significance level, presenting evidence favorable to cointegration at a lag order of 8.
+
+
+# CONCLUSIONS AND PRACTICAL APPLICATIONS
+
+This paper aimed at understanding which factors have heavier influence in 2020 GDP real growth, considering this variable as a representation of COVID-19 impact. Quantitative analysis of features was performed along the study and provided valuable insights on how they relate to response variable and among them.
+
+The use of principal component analysis helped to group correlated predictor into groups of similar contexts. Variables connected to fiscal and monetary stimulus were put together in a single predictor, which came to be significant in our final model and showed direct linear relationship to GPD real growth.
+
+Stringency index, as well as cases and deaths, are other variables in our model directly related to COVID-19 - as opposed to demographics and diabetes prevalence, for example. 
+For countries where the pandemic is still peaking, such as Brazil, stimulus is still an option to respond to COVID-19 impact on the economy. National or regional restrictions may also impact stringency index and number of cases and deaths.
+
+In this scenario, a practical application of the fitted model is to estimate the effect of these factors on the next yearly growth output (2021).
+
+As immunization programs advance, it is expected that governments will start easing social-distancing restrictions. As shown in the Israeli case, there is evidence of cointegration between total vaccinations and stringency index at a lag order of 8 - implying that a change in vaccinated population may have an impact on stringency shortly after one week.
+
+This timeframe cannot be generalized to other countries, especially due to the diverse effectiveness of vaccine products and different approaches to social-distancing restrictions. However, it offers a hint on how vaccination drives to a better context for economic reopening.
+
+
+
+
+
+
